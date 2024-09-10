@@ -440,6 +440,8 @@ def backupDirIds(vault_base, zip_backup):
 
 
 if __name__ == '__main__':
+    locale.setlocale(locale.LC_ALL, '')
+
     parser = argparse.ArgumentParser(description="List and decrypt files in a gocryptfs filesystem")
     parser.add_argument('--print-key', help="Print the master key in ASCII85 (a85) or BASE64 (b64) format", type=str, choices=['a85','b64'])
     parser.add_argument('--master-key', nargs=1, metavar=('MASTER_KEY'), help="Master key in ASCII85 or BASE64 format")
