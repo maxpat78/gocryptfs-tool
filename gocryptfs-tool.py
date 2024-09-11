@@ -17,14 +17,21 @@ import time, zipfile, locale
 try:
     from Cryptodome.Protocol.KDF import HKDF
     from Cryptodome.Cipher import AES
+    from Cryptodome.Cipher import ChaCha20_Poly1305
     from Cryptodome.Hash import SHA256
 except ImportError:
     from Crypto.Protocol.KDF import HKDF
     from Crypto.Cipher import AES
+    from Crypto.Cipher import ChaCha20_Poly1305
     from Crypto.Hash import SHA256
 
 S_AES_GCM = b"AES-GCM file content encryption"
+S_AES_SIV = b"AES-SIV file content encryption"
 S_AES_EME = b"EME filename encryption"
+S_XCHACHA = b"XChaCha20-Poly1305 file content encryption"
+
+ZEROED = bytearray(4096)
+EZEROED = None
 
 class AES256_EME:
     "AES-256 ECB-Mix-ECB or Encrypt-Mix-Encrypt mode (Halevi-Rogaway, 2003)"
@@ -164,8 +171,22 @@ class Vault:
         except:
             raise BaseException('Unaccessible or invalid '+vcs)
         config = json.loads(s)
+        # supported characteristics
+        p.aessiv = 'AESSIV' in config['FeatureFlags']
+        p.xchacha = 'XChaCha20Poly1305' in config['FeatureFlags']
+        if p.xchacha:
+            EZEROED = bytearray(4096+40)
+        else:
+            EZEROED = bytearray(4096+32)
         assert config['Version'] == 2
-        assert 'HKDF' in config['FeatureFlags']
+        assert 'HKDF' in config['FeatureFlags'] # or it should use directly the master key or its SHA512 hash (SIV)
+        assert 'DirIV' in config['FeatureFlags'] # per-directory IV
+        assert 'GCMIV128' in config['FeatureFlags'] # mandatory v. 1.0+
+        assert 'FIDO2' not in config['FeatureFlags'] # actually unsupported
+        # PlaintextNames if names are not encoded/encrypted
+        # LongNames is supported if a long name is found
+        # LongNameMax is implicitly set to 255
+        # Raw64 enables unpadded base64 encoded names (here supported implicitly)
         p.config = config
         if pk:
             p.pk = pk
@@ -185,21 +206,24 @@ class Vault:
                 p.pk = aes.decrypt_and_verify(ciphertext, tag)
             except:
                 raise BaseException("Could not decrypt master key from config file: bad password?")
-            # generate the AES-EME key to decrypt file names and the decryptor object
-            p.ek = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_AES_EME)
-            p.ed = AES256_EME(p.ek)
+            if 'EMENames' in config['FeatureFlags']:
+                # generate the AES-EME key to decrypt file names and the decryptor object
+                p.ek = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_AES_EME)
+                p.ed = AES256_EME(p.ek)
+            else:
+                p.ed = None
 
     def encryptName(p, iv, name):
         "Encrypts a name contained in a given directory"
         bname = pad16(name.encode())
-        bname = p.ed.encrypt_iv(iv, bname)
+        if p.ed: bname = p.ed.encrypt_iv(iv, bname)
         # gocryptfs driver does not like '=' in base64 encoded names; base64 module dislikes their absence
         bname = base64.urlsafe_b64encode(bname).strip(b'=').decode()
         return bname
 
     def decryptName(p, iv, name):
         dname = d64(name, 1)
-        bname = p.ed.decrypt_iv(iv, dname)
+        if p.ed: bname = p.ed.decrypt_iv(iv, dname)
         bname = unpad16(bname)
         try:
             bname = bname.decode()
@@ -235,6 +259,8 @@ class Vault:
         
     def getFilePath(p, virtualpath):
         "Get the real pathname of a virtual file pathname inside the vault"
+        if virtualpath[0] != '/':
+            raise BaseException('A virtual path inside the gocryptfs vault must be always absolute!')
         vbase = os.path.dirname(virtualpath)
         vname = os.path.basename(virtualpath)
         realbase = p.getDirPath(vbase)
@@ -281,7 +307,12 @@ class Vault:
         assert h[0:2] == b"\x00\x02"
 
         # Get content key
-        key = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_AES_GCM)
+        if p.aessiv:
+            key = HKDF(p.pk, salt=b"", key_len=64, hashmod=SHA256, context=S_AES_SIV)
+        elif p.xchacha:
+            key = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_XCHACHA)
+        else:
+            key = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_AES_GCM)
         
         # Process contents (AES-GCM encrypted)
         if os.path.exists(dest) and not force:
@@ -289,16 +320,28 @@ class Vault:
         out = open(dest, 'wb')
         n = 0
         while True:
-            s = f.read(4096+32) # an encrypted block is at most 4K + 32 bytes
+            blklen = 4096+32
+            if p.xchacha: blklen += 8
+            s = f.read(blklen) # an encrypted block is at most 4K + 32 (40 with XChaCha) bytes
             if not s: break
-            nonce, payload, tag = s[:16], s[16:-16], s[-16:]
-            aes = AES.new(key, AES.MODE_GCM, nonce=nonce)
-            aes.update(struct.pack('>Q', n) + h[2:]) # AAD: 64-bit BE block number + fileid
-            try:
-                ds = aes.decrypt_and_verify(payload, tag)
-            except:
-                print("warning: block %d is damaged and won't be decrypted" % n)
-                ds = payload
+            if s != EZEROED:
+                if p.aessiv:
+                    nonce, tag, payload = s[:16], s[16:32], s[32:]
+                    cry = AES.new(key, AES.MODE_SIV, nonce=nonce)
+                elif p.xchacha:
+                    nonce, payload, tag = s[:24], s[24:-16], s[-16:]
+                    cry = ChaCha20_Poly1305.new(key=key, nonce=nonce)
+                else:
+                    nonce, payload, tag = s[:16], s[16:-16], s[-16:]
+                    cry = AES.new(key, AES.MODE_GCM, nonce=nonce)
+                cry.update(struct.pack('>Q', n) + h[2:]) # AAD: 64-bit BE block number + fileid
+                try:
+                    ds = cry.decrypt_and_verify(payload, tag)
+                except:
+                    print("warning: block %d is damaged and won't be decrypted" % n)
+                    ds = payload
+            else:
+                ds = ZEROED # zeroed block is not encrypted
             out.write(ds)
             n += 1
         f.close()
