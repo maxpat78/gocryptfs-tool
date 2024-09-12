@@ -173,20 +173,23 @@ class Vault:
         config = json.loads(s)
         # supported characteristics
         p.aessiv = 'AESSIV' in config['FeatureFlags']
-        p.xchacha = 'XChaCha20Poly1305' in config['FeatureFlags']
+        p.xchacha = 'XChaCha20Poly1305' in config['FeatureFlags'] # v 2.2.0+
+        p.plain_names = 'PlaintextNames' in config['FeatureFlags'] # names are not encrypted
+        p.raw64 = 'Raw64' in config['FeatureFlags'] # unpadded base64 encoded names
+        if p.raw64 and p.plain_names:
+            raise BaseException('Raw64 conflicts with PlaintextNames flag!') 
         if p.xchacha:
             EZEROED = bytearray(4096+40)
         else:
             EZEROED = bytearray(4096+32)
         assert config['Version'] == 2
+        if not p.plain_names:
+            assert 'DirIV' in config['FeatureFlags'] # per-directory IV (default, unless deterministic names selected)
         assert 'HKDF' in config['FeatureFlags'] # or it should use directly the master key or its SHA512 hash (SIV)
-        assert 'DirIV' in config['FeatureFlags'] # per-directory IV
-        assert 'GCMIV128' in config['FeatureFlags'] # mandatory v. 1.0+
+        if not p.xchacha: assert 'GCMIV128' in config['FeatureFlags'] # mandatory v. 1.0+
         assert 'FIDO2' not in config['FeatureFlags'] # actually unsupported
-        # PlaintextNames if names are not encoded/encrypted
-        # LongNames is supported if a long name is found
+        # LongNames are supported when a long name is found
         # LongNameMax is implicitly set to 255
-        # Raw64 enables unpadded base64 encoded names (here supported implicitly)
         p.config = config
         if pk:
             p.pk = pk
@@ -217,11 +220,13 @@ class Vault:
         "Encrypts a name contained in a given directory"
         bname = pad16(name.encode())
         if p.ed: bname = p.ed.encrypt_iv(iv, bname)
-        # gocryptfs driver does not like '=' in base64 encoded names; base64 module dislikes their absence
-        bname = base64.urlsafe_b64encode(bname).strip(b'=').decode()
-        return bname
+        # python base64 module does NOT like absent padding!
+        bname = base64.urlsafe_b64encode(bname)
+        if p.raw64: bname = bname.strip(b'=')
+        return bname.decode()
 
     def decryptName(p, iv, name):
+        if p.plain_names: return name.decode()
         dname = d64(name, 1)
         if p.ed: bname = p.ed.decrypt_iv(iv, dname)
         bname = unpad16(bname)
@@ -233,6 +238,7 @@ class Vault:
 
     def getDirId(p, virtualpath):
         "Get the Directory IV related to a virtual path inside the vault"
+        if p.plain_names: return None
         rp = p.getDirPath(virtualpath)
         ivf = os.path.join(rp, 'gocryptfs.diriv')
         if not os.path.exists(ivf):
@@ -245,8 +251,10 @@ class Vault:
         "Get the real pathname of a virtual directory path inside the vault"
         if virtualpath[0] != '/':
             raise BaseException('A virtual path inside the gocryptfs vault must be always absolute!')
-        parts = virtualpath.split('/')
         rp = p.base
+        if p.plain_names:
+            return os.path.join(rp, virtualpath[1:])
+        parts = virtualpath.split('/')
         ivs = os.path.join(p.base, 'gocryptfs.diriv') # root IV
         iv = open(ivs, 'rb').read()
         for it in parts:
@@ -264,6 +272,8 @@ class Vault:
         vbase = os.path.dirname(virtualpath)
         vname = os.path.basename(virtualpath)
         realbase = p.getDirPath(vbase)
+        if p.plain_names:
+            return os.path.join(p.base, virtualpath[1:])
         iv = p.getDirId(vbase)
         if vname:
             ename = p.encryptName(iv, vname)
@@ -439,15 +449,15 @@ def unpad16(s):
     z = bytearray()
     for c in s:
         if c <= 16: break
-        z += c.to_bytes()
-    return z
+        z += c.to_bytes(1, 'little') # Python Linux 3.10.12 wants (1, '<order>')
+    return bytes(z)
 
 def pad16(s):
     "PKCS#7 padding"
     blocks = (len(s)+15) // 16
     if not len(s)%16: blocks += 1 # if len is 16 bytes or multiple, gets additional 16 bytes
     added = blocks*16 - len(s)
-    r = bytearray(added.to_bytes()) * (blocks*16)
+    r = bytearray(added.to_bytes(1,'little')) * (blocks*16)
     r[:len(s)] = s # s must be bytes
     return r
 
