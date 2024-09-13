@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!python3
 
 """
 
@@ -176,6 +176,7 @@ class Vault:
         p.xchacha = 'XChaCha20Poly1305' in config['FeatureFlags'] # v 2.2.0+
         p.plain_names = 'PlaintextNames' in config['FeatureFlags'] # names are not encrypted
         p.raw64 = 'Raw64' in config['FeatureFlags'] # unpadded base64 encoded names
+        p.deterministic = 'DirIV' not in config['FeatureFlags'] # per-directory IV is default
         if p.raw64 and p.plain_names:
             raise BaseException('Raw64 conflicts with PlaintextNames flag!') 
         if p.xchacha:
@@ -183,8 +184,6 @@ class Vault:
         else:
             EZEROED = bytearray(4096+32)
         assert config['Version'] == 2
-        if not p.plain_names:
-            assert 'DirIV' in config['FeatureFlags'] # per-directory IV (default, unless deterministic names selected)
         assert 'HKDF' in config['FeatureFlags'] # or it should use directly the master key or its SHA512 hash (SIV)
         if not p.xchacha: assert 'GCMIV128' in config['FeatureFlags'] # mandatory v. 1.0+
         assert 'FIDO2' not in config['FeatureFlags'] # actually unsupported
@@ -238,7 +237,7 @@ class Vault:
 
     def getDirId(p, virtualpath):
         "Get the Directory IV related to a virtual path inside the vault"
-        if p.plain_names: return None
+        if p.plain_names or p.deterministic: return b'\x00'*16
         rp = p.getDirPath(virtualpath)
         ivf = os.path.join(rp, 'gocryptfs.diriv')
         if not os.path.exists(ivf):
@@ -255,14 +254,22 @@ class Vault:
         if p.plain_names:
             return os.path.join(rp, virtualpath[1:])
         parts = virtualpath.split('/')
-        ivs = os.path.join(p.base, 'gocryptfs.diriv') # root IV
-        iv = open(ivs, 'rb').read()
+        if not p.deterministic:
+            ivs = os.path.join(p.base, 'gocryptfs.diriv') # root IV
+            iv = open(ivs, 'rb').read()
+        else:
+            iv = b'\x00'*16
         for it in parts:
             if not it: continue
             ite = p.encryptName(iv, it)
+            if len(ite) > 255:
+                # gets the SHA-256 hash, base64 encoded, of the encrypted longname
+                hash = base64.urlsafe_b64encode(SHA256.new(ite.encode()).digest()).strip(b'=').decode()
+                ite = 'gocryptfs.longname.%s'%hash
             rp = os.path.join(rp, ite)
-            ivs = os.path.join(rp, 'gocryptfs.diriv')
-            iv = open(ivs, 'rb').read()
+            if not p.deterministic:
+                ivs = os.path.join(rp, 'gocryptfs.diriv')
+                iv = open(ivs, 'rb').read()
         return rp
         
     def getFilePath(p, virtualpath):
@@ -324,7 +331,7 @@ class Vault:
         else:
             key = HKDF(p.pk, salt=b"", key_len=32, hashmod=SHA256, context=S_AES_GCM)
         
-        # Process contents (AES-GCM encrypted)
+        # Process contents
         if os.path.exists(dest) and not force:
             raise BaseException('destination file "%s" exists and won\'t get overwritten!'%dest)
         out = open(dest, 'wb')
