@@ -177,6 +177,10 @@ class Vault:
         p.plain_names = 'PlaintextNames' in config['FeatureFlags'] # names are not encrypted
         p.raw64 = 'Raw64' in config['FeatureFlags'] # unpadded base64 encoded names
         p.deterministic = 'DirIV' not in config['FeatureFlags'] # per-directory IV is default
+        # LongNames are supported when a long name is found
+        p.longnamemax = 255 # limit to switch to gocryptfs.longname
+        if 'LongNameMax' in config['FeatureFlags']:
+            p.longnamemax = int(config['FeatureFlags']['LongNameMax'])
         if p.raw64 and p.plain_names:
             raise BaseException('Raw64 conflicts with PlaintextNames flag!') 
         if p.xchacha:
@@ -187,8 +191,6 @@ class Vault:
         assert 'HKDF' in config['FeatureFlags'] # or it should use directly the master key or its SHA512 hash (SIV)
         if not p.xchacha: assert 'GCMIV128' in config['FeatureFlags'] # mandatory v. 1.0+
         assert 'FIDO2' not in config['FeatureFlags'] # actually unsupported
-        # LongNames are supported when a long name is found
-        # LongNameMax is implicitly set to 255
         p.config = config
         if pk:
             p.pk = pk
@@ -238,16 +240,18 @@ class Vault:
     def getDirId(p, virtualpath):
         "Get the Directory IV related to a virtual path inside the vault"
         if p.plain_names or p.deterministic: return b'\x00'*16
-        rp = p.getDirPath(virtualpath)
+        rp = p.getRealPath(virtualpath)
+        if not os.path.exists(rp):
+            raise BaseException(virtualpath+' does not exist')
         ivf = os.path.join(rp, 'gocryptfs.diriv')
         if not os.path.exists(ivf):
-            raise BaseException('Could not find directory IV in '+virtualpath)
+            raise BaseException('No gocryptfs.diriv in '+virtualpath)
         iv = open(ivf,'rb').read()
         assert len(iv) == 16
         return iv
 
-    def getDirPath(p, virtualpath):
-        "Get the real pathname of a virtual directory path inside the vault"
+    def getRealPath(p, virtualpath, isdir=False):
+        "Get the real pathname associated to a virtual one"
         if virtualpath[0] != '/':
             raise BaseException('A virtual path inside the gocryptfs vault must be always absolute!')
         rp = p.base
@@ -255,58 +259,28 @@ class Vault:
             return os.path.join(rp, virtualpath[1:])
         parts = virtualpath.split('/')
         if not p.deterministic:
-            ivs = os.path.join(p.base, 'gocryptfs.diriv') # root IV
+            ivs = os.path.join(rp, 'gocryptfs.diriv') # root IV
             iv = open(ivs, 'rb').read()
         else:
-            iv = b'\x00'*16
+            iv = b'\x00'*16 # zero IV
+        n = 1
         for it in parts:
+            n += 1
             if not it: continue
             ite = p.encryptName(iv, it)
-            if len(ite) > 255:
-                # gets the SHA-256 hash, base64 encoded, of the encrypted longname
+            if len(ite) > p.longnamemax:
+                # SHA-256 hash, base64 encoded, of the encrypted longname
                 hash = base64.urlsafe_b64encode(SHA256.new(ite.encode()).digest()).strip(b'=').decode()
                 ite = 'gocryptfs.longname.%s'%hash
             rp = os.path.join(rp, ite)
-            if not p.deterministic:
+            if not p.deterministic and os.path.isdir(rp):
                 ivs = os.path.join(rp, 'gocryptfs.diriv')
                 iv = open(ivs, 'rb').read()
         return rp
-        
-    def getFilePath(p, virtualpath):
-        "Get the real pathname of a virtual file pathname inside the vault"
-        if virtualpath[0] != '/':
-            raise BaseException('A virtual path inside the gocryptfs vault must be always absolute!')
-        vbase = os.path.dirname(virtualpath)
-        vname = os.path.basename(virtualpath)
-        realbase = p.getDirPath(vbase)
-        if p.plain_names:
-            return os.path.join(p.base, virtualpath[1:])
-        iv = p.getDirId(vbase)
-        if vname:
-            ename = p.encryptName(iv, vname)
-            if len(ename) > 255:
-                # gets the SHA-256 hash, base64 encoded, of the encrypted longname
-                hash = base64.urlsafe_b64encode(SHA256.new(ename.encode()).digest()).strip(b'=').decode()
-                ename = 'gocryptfs.longname.%s'%hash # contents
-            target = os.path.join(realbase, ename)
-        else:
-            target = realbase
-        if not os.path.exists(target):
-            raise BaseException(virtualpath+' is not a valid virtual file pathname')
-        return target
-        
-    def listDir(p, virtualpath):
-        "List directory contents of a virtual path inside the vault"
-        realpath = p.getDirPath(virtualpath)
-        dirId = p.getDirId(virtualpath)
-        for it in os.scandir(realpath):
-            if it.name == 'dirid.c9r': continue
-            dname = decryptName(p.pk, p.hk, dirId.encode(), it.name.encode())
-            print(dname)
 
     def decryptFile(p, virtualpath, dest, force=False):
         "Decrypt a file from a virtual pathname and puts it in real 'dest'"
-        f = open(p.getFilePath(virtualpath), 'rb')
+        f = open(p.getRealPath(virtualpath), 'rb')
         
         # Get header
         h = f.read(18)
@@ -371,7 +345,7 @@ class Vault:
     def decryptDir(p, virtualpath, dest, force=False):
         if (virtualpath[0] != '/'):
             raise BaseException('the vault path to decrypt must be absolute!')
-        real = p.getDirPath(virtualpath) # test existance
+        real = p.getRealPath(virtualpath) # test existance
         n=0
         nn=0
         total_bytes = 0
@@ -392,7 +366,7 @@ class Vault:
 
     def stat(p, virtualpath):
         "Perform os.stat on a virtual pathname"
-        target = p.getFilePath(virtualpath)
+        target = p.getRealPath(virtualpath)
         return os.stat(target)
 
     def ls(p, virtualpath, recursive=False):
@@ -420,7 +394,7 @@ class Vault:
         
     def walk(p, virtualpath):
         "Traverse the virtual file system like os.walk"
-        realpath = p.getDirPath(virtualpath)
+        realpath = p.getRealPath(virtualpath)
         dirId = p.getDirId(virtualpath)
         root = virtualpath
         dirs = []
@@ -549,7 +523,7 @@ if __name__ == '__main__':
         if len(extras) == 1:
             print('please use: alias <virtual_pathname>')
             sys.exit(1)
-        print('"%s" is the real pathname for %s' % (v.getFilePath(extras[1]), extras[1]))
+        print('"%s" is the real pathname for %s' % (v.getRealPath(extras[1]), extras[1]))
     elif extras[0] == 'backup':
         if len(extras) == 1:
             print('please use: backup <ZIP archive>')
@@ -573,8 +547,7 @@ if __name__ == '__main__':
             sys.exit(1)
         isdir = 0
         try:
-            v.getDirPath(extras[1])
-            isdir = 1
+            isdir = os.path.isdir(v.getRealPath(extras[1]))
         except: pass
         if isdir: v.decryptDir(extras[1], extras[2], force)
         else:
